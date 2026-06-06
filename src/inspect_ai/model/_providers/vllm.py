@@ -7,7 +7,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import anyio
-from openai import APIConnectionError, APIStatusError
+from openai import APIConnectionError, APIStatusError, NotFoundError
 from tenacity.wait import WaitBaseT, wait_fixed
 from typing_extensions import override
 
@@ -464,7 +464,17 @@ class VLLMAPI(OpenAICompatibleAPI):
         if self.is_mistral:
             input = functools.reduce(mistral_message_reducer, input, [])
 
-        return await super().generate(input, tools, tool_choice, config)
+        try:
+            return await super().generate(input, tools, tool_choice, config)
+        except NotFoundError as ex:
+            if len(tools) > 0:
+                raise RuntimeError(
+                    "vLLM returned 404 for a request with tools. "
+                    "Either start vLLM with --enable-auto-tool-choice and "
+                    "--tool-call-parser=<parser> (e.g. hermes, llama3_json, mistral), "
+                    "or use -M emulate_tools=true as a fallback."
+                ) from ex
+            raise
 
     @override
     def handle_bad_request(self, ex: APIStatusError) -> ModelOutput | Exception:
