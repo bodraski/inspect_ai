@@ -470,7 +470,8 @@ class VLLMAPI(OpenAICompatibleAPI):
             if len(tools) > 0:
                 raise RuntimeError(
                     "vLLM returned 404 for a request with tools. "
-                    "Either start vLLM with --enable-auto-tool-choice and "
+                    "This might indicate vLLM server was started without tool calling enabled."
+                    "Try starting vLLM with --enable-auto-tool-choice and "
                     "--tool-call-parser=<parser> (e.g. hermes, llama3_json, mistral), "
                     "or use -M emulate_tools=true as a fallback."
                 ) from ex
