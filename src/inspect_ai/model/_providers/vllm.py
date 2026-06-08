@@ -7,7 +7,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import anyio
-from openai import APIConnectionError, APIStatusError
+from openai import APIConnectionError, APIStatusError, NotFoundError
 from tenacity.wait import WaitBaseT, wait_fixed
 from typing_extensions import override
 
@@ -25,6 +25,7 @@ from inspect_ai._util.local_server import (
     start_local_server,
     terminate_process,
 )
+from inspect_ai._util.logger import warn_once
 from inspect_ai.model._chat_message import (
     ChatMessage,
     ChatMessageTool,
@@ -464,7 +465,21 @@ class VLLMAPI(OpenAICompatibleAPI):
         if self.is_mistral:
             input = functools.reduce(mistral_message_reducer, input, [])
 
-        return await super().generate(input, tools, tool_choice, config)
+        try:
+            return await super().generate(input, tools, tool_choice, config)
+        except NotFoundError:
+            if len(tools) > 0:
+                warn_once(
+                    logger,
+                    "vLLM returned 404 for a request with tools — "
+                    "server is not configured for native tool calling. "
+                    "Falling back to tool emulation. For better results, "
+                    "restart vLLM with --enable-auto-tool-choice and "
+                    "--tool-call-parser=<parser> (e.g. hermes, llama3_json, mistral).",
+                )
+                self.emulate_tools = True
+                return await super().generate(input, tools, tool_choice, config)
+            raise
 
     @override
     def handle_bad_request(self, ex: APIStatusError) -> ModelOutput | Exception:
