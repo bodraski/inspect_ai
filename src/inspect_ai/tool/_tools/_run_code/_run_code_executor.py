@@ -1,14 +1,54 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol, get_args
+
+from pydantic import TypeAdapter
 
 from inspect_ai._util.content import Content, ContentText
 from inspect_ai._util.error import pip_dependency_error
 
 from ..._tool import ToolError
 from ..._tool_def import ToolDef
-from ._bridge import RunCodeInnerToolCallTraceEntry, RunCodeToolBridge
+from ._bridge import (
+    RunCodeInnerToolCallTraceEntry,
+    RunCodeToolBridge,
+    _is_content,
+    _is_content_list,
+)
+
+_content_item_adapter: TypeAdapter[Content] = TypeAdapter(Content)
+
+_content_types = {cls.model_fields["type"].default for cls in get_args(Content)}
+
+
+def _looks_like_content(value: dict[str, Any]) -> bool:
+    return value.get("type") in _content_types
+
+
+def _restore(value: Any) -> Any:
+    if isinstance(value, dict) and _looks_like_content(value):
+        return _content_item_adapter.validate_python(value)
+    if isinstance(value, list):
+        return [_restore(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _restore(v) for k, v in value.items()}
+    return value
+
+
+def _reconstruct_content(value: Any) -> list[Content]:
+    """Restoring serialized Content in place."""
+    restored = _restore(value)
+    if _is_content_list(restored):
+        return restored
+    if _is_content(restored):
+        return [restored]
+    return [
+        ContentText(
+            text=json.dumps(restored) if not isinstance(restored, str) else restored
+        )
+    ]
 
 
 @dataclass
@@ -83,10 +123,7 @@ class MontyRunCodeExecutor:
             contents: list[Content] = []
 
             if output is not None:
-                contents.append(ContentText(text=str(output)))
-
-            contents.extend(bridge.artifacts)
-
+                contents.extend(_reconstruct_content(output))
             return RunCodeResult(
                 output=contents,
                 inner_tool_call_trace=bridge.call_trace,

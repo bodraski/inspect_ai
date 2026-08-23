@@ -2,10 +2,11 @@ import anyio
 import pytest
 from test_helpers.utils import skip_if_trio
 
-from inspect_ai._util.content import Content, ContentImage, ContentText
+from inspect_ai._util.content import ContentImage, ContentText
 from inspect_ai._util.exception import TerminateSampleError
 from inspect_ai._util.registry import registry_info
 from inspect_ai.approval import ApprovalPolicy, approval, auto_approver
+from inspect_ai.model._chat_message import ChatMessage
 from inspect_ai.tool import Tool, ToolDef, ToolError, run_code
 from inspect_ai.tool._tool_call import ToolCall
 from inspect_ai.tool._tools._run_code._bridge import (
@@ -15,12 +16,12 @@ from inspect_ai.tool._tools._run_code._bridge import (
     _preview,
 )
 from inspect_ai.tool._tools._run_code._run_code import (
+    TRUNCATION_MARKER,
     _format_run_code_result,
     _run_code_usage_description,
     _tool_defs,
     _tool_interface_description,
     _tool_signature,
-    _truncate_content,
     _validate_tool_names,
 )
 from inspect_ai.tool._tools._run_code._run_code_executor import RunCodeResult
@@ -193,8 +194,9 @@ async def test_run_code_returns_falsy_results():
     for code, expected in [
         ("0", "0"),
         ("1 - 1", "0"),
-        ("False", "False"),
+        ("False", "false"),
         ("[]", "[]"),
+        ("{}", "{}"),
     ]:
         result = await tool(code=code)
         assert result
@@ -241,7 +243,6 @@ async def test_run_code_bridge_records_inner_tool_call():
     assert bridge.call_trace[0].args_preview == "('hello',)"
     assert bridge.call_trace[0].kwargs_preview == "{}"
     assert "hello" in bridge.call_trace[0].result_preview
-    assert "artifacts=0" in bridge.call_trace[0].result_preview
     assert bridge.call_trace[0].error is None
 
 
@@ -415,65 +416,205 @@ async def test_run_code_enforces_timeout():
     assert "timed out" in result[0].text
 
 
+SHORT_TEXT = "short test text"
+LONG_TEXT = " ".join([SHORT_TEXT] * 100)
+MOCK_BASE64_IMAGE = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8"
+    "AAAAASUVORK5CYII="
+)
+chunk = "AAAA"
+LARGE_PADDING = chunk * 250_000
+LARGE_MOCK_BASE64_IMAGE = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8"
+    "AAAAASUVORK5CYII=" + LARGE_PADDING
+)
+
+
 class LargeOutputRunCodeExecutor:
     async def execute(self, code: str) -> RunCodeResult:
-        return RunCodeResult(output=[ContentText(text="x" * 100)])
+        return RunCodeResult(output=[ContentText(text=LONG_TEXT)])
+
+
+class LargeContentBlocksRunCodeExecutor:
+    async def execute(self, code: str) -> RunCodeResult:
+        return RunCodeResult(
+            output=[ContentText(text=SHORT_TEXT), ContentText(text=LONG_TEXT)]
+        )
+
+
+class MixedContentRunCodeExecutor:
+    async def execute(self, code: str) -> RunCodeResult:
+        return RunCodeResult(
+            output=[ContentText(text=SHORT_TEXT), ContentImage(image=MOCK_BASE64_IMAGE)]
+        )
+
+
+class LargeMixedContentRunCodeExecutor:
+    async def execute(self, code: str) -> RunCodeResult:
+        return RunCodeResult(
+            output=[
+                ContentText(text=LONG_TEXT),
+                ContentImage(image=LARGE_MOCK_BASE64_IMAGE),
+            ]
+        )
+
+
+class FakeModel:
+    """Deterministic stand-in for count_tokens, no network/API calls."""
+
+    async def count_tokens(self, input: str | list[ChatMessage]) -> int:
+        if isinstance(input, str):
+            return len(input.split())
+        # non-text content branch — content itself doesn't matter for
+        # truncation-of-text tests, just needs to be deterministic
+        return 20
+
+
+@pytest.fixture
+def fake_model_get_model(monkeypatch: pytest.MonkeyPatch) -> FakeModel:
+    model = FakeModel()
+    monkeypatch.setattr(
+        "inspect_ai.tool._tools._run_code._run_code.get_model",
+        lambda *args, **kwargs: model,
+    )
+    return model
 
 
 @pytest.mark.anyio
-async def test_run_code_truncates_output():
+async def test_run_code_truncates_output(fake_model_get_model):
+    max_tokens = 20
     tool = run_code(
         executor=LargeOutputRunCodeExecutor(),
-        max_output_chars=50,
+        max_output_tokens=max_tokens,
     )
 
     result = await tool(code="large")
+    output_text = result[0].text
 
-    assert len(result[0].text) <= 50
-    assert "truncated" in result[0].text
+    truncated_tokens = await fake_model_get_model.count_tokens(output_text)
+
+    assert truncated_tokens <= max_tokens
+    assert TRUNCATION_MARKER in output_text
+    assert output_text.startswith(SHORT_TEXT.split()[0])
 
 
 @pytest.mark.anyio
 async def test_run_code_does_not_truncate_output_by_default():
-    long_text = "x" * 25_000
-
-    class LongOutputExecutor:
-        async def execute(self, code: str) -> RunCodeResult:
-            return RunCodeResult(output=[ContentText(text=long_text)])
-
-    tool = run_code(executor=LongOutputExecutor())
+    tool = run_code(
+        executor=LargeOutputRunCodeExecutor(),
+        max_output_tokens=None,
+    )
 
     result = await tool(code="ignored")
+    output_text = result[0].text
 
-    assert result == [ContentText(text=long_text)]
-
-
-def test_truncate_content_preserves_trailing_image():
-    content = [
-        ContentText(text="x" * 100),
-        ContentImage(image="data:image/png;base64,AAAA"),
-    ]
-
-    result = _truncate_content(content, max_chars=10)
-
-    assert any(isinstance(item, ContentImage) for item in result)
+    assert output_text == LONG_TEXT
 
 
-def test_truncate_content_stays_within_limit_across_text_blocks():
-    content = [ContentText(text="a" * 30), ContentText(text="b" * 30)]
+@pytest.mark.anyio
+async def test_run_code_content_fits_budget_no_truncation(fake_model_get_model):
+    max_tokens = len(LONG_TEXT.split())
+    tool = run_code(
+        executor=LargeOutputRunCodeExecutor(),
+        max_output_tokens=max_tokens,
+    )
 
-    result = _truncate_content(content, max_chars=30)
+    result = await tool(code="large")
+    output_text = result[0].text
 
-    total = sum(len(item.text) for item in result if isinstance(item, ContentText))
-    assert total <= 30
+    truncated_tokens = await fake_model_get_model.count_tokens(output_text)
+
+    assert truncated_tokens == max_tokens
+    assert output_text == LONG_TEXT
 
 
-def test_truncate_content_handles_max_chars_below_suffix():
-    result = _truncate_content([ContentText(text="a" * 100)], max_chars=5)
+@pytest.mark.anyio
+async def test_truncate_text_content_stays_within_limit_across_text_blocks(
+    fake_model_get_model,
+):
+    max_tokens = 50
+    tool = run_code(
+        executor=LargeContentBlocksRunCodeExecutor(),
+        max_output_tokens=max_tokens,
+    )
 
-    total = sum(len(item.text) for item in result if isinstance(item, ContentText))
-    assert total <= 5
-    assert result[0].text.endswith("...")
+    result = await tool(code="large_blocks")
+    total_tokens = 0
+
+    assert len(result) == 2
+
+    for i, item in enumerate(result):
+        truncated_tokens = await fake_model_get_model.count_tokens(item.text)
+        total_tokens += truncated_tokens
+
+        if i == len(result) - 1:
+            assert TRUNCATION_MARKER in item.text
+        else:
+            assert TRUNCATION_MARKER not in item.text
+
+        assert total_tokens <= max_tokens
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_model_get_model")
+async def test_truncate_content_keeps_image_that_fits():
+    max_tokens = 3 + 20
+    tool = run_code(
+        executor=MixedContentRunCodeExecutor(),
+        max_output_tokens=max_tokens,
+    )
+
+    result = await tool(code="mixed")
+
+    assert len(result) == 2
+    assert isinstance(result[0], ContentText) and result[0].text == SHORT_TEXT
+    assert isinstance(result[1], ContentImage) and result[1].image == MOCK_BASE64_IMAGE
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_model_get_model")
+async def test_truncate_content_replaces_image_with_placeholder():
+    max_tokens = 3 + 10
+    tool = run_code(
+        executor=MixedContentRunCodeExecutor(),
+        max_output_tokens=max_tokens,
+    )
+
+    result = await tool(code="mixed")
+
+    assert len(result) == 2
+    assert isinstance(result[1], ContentText)
+    assert "exceeded token budget" in result[1].text
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_model_get_model")
+async def test_truncate_content_replaces_image_with_fallback():
+    max_tokens = 5
+    tool = run_code(
+        executor=MixedContentRunCodeExecutor(),
+        max_output_tokens=max_tokens,
+    )
+
+    result = await tool(code="mixed")
+
+    assert len(result) == 2
+    assert isinstance(result[1], ContentText)
+    assert TRUNCATION_MARKER in result[1].text
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("fake_model_get_model")
+async def test_truncate_content_drops_item_when_budget_exhausted():
+    max_tokens = 10
+    tool = run_code(
+        executor=LargeMixedContentRunCodeExecutor(),
+        max_output_tokens=max_tokens,
+    )
+
+    result = await tool(code="large_mixed")
+
+    assert len(result) == 1
 
 
 def test_run_code_preview_truncates_long_values():
@@ -683,15 +824,13 @@ f"{len(txs)} txs total={total}"
 
 def test_project_result_raises_on_unprojectable_value():
     # Neither scalar, Content, nor JSON-serializable: raise instead of
-    # degrading to text, and leave artifacts untouched.
+    # degrading to text.
     bridge = RunCodeToolBridge([])
     circular: dict = {}
     circular["self"] = circular
 
     with pytest.raises(ToolError):
         bridge._project_result(circular, "demo_tool")
-
-    assert bridge.artifacts == []
 
 
 @pytest.mark.anyio
@@ -913,55 +1052,6 @@ async def test_run_code_monty_runs_inner_tool_when_approval_allows_it():
 
     assert calls == ["secret"]
     assert result[0].text == "approved:secret"
-
-
-def image_tool() -> Tool:
-    async def execute() -> list[Content]:
-        """Return an image.
-
-        Returns:
-            Image content.
-        """
-        return [
-            ContentText(text="here is your image"),
-            ContentImage(image="data:image/png;base64,abc123"),
-        ]
-
-    return ToolDef(
-        execute,
-        name="image_tool",
-        description="Return an image.",
-    ).as_tool()
-
-
-@pytest.mark.anyio
-async def test_run_code_bridge_collects_image_artifacts():
-    bridge = RunCodeToolBridge(_tool_defs([image_tool()]))
-    external_functions = bridge.external_functions()
-
-    result = await external_functions["image_tool"]()
-
-    assert result == "here is your image"
-
-    assert len(bridge.artifacts) == 1
-    assert isinstance(bridge.artifacts[0], ContentImage)
-    assert bridge.artifacts[0].image == "data:image/png;base64,abc123"
-
-
-@pytest.mark.anyio
-@skip_if_trio  # pydantic-monty runs on asyncio
-async def test_run_code_artifacts_appear_in_result():
-    pytest.importorskip("pydantic_monty")
-    tool = run_code(tools=[image_tool()], executor="monty")
-
-    result = await tool(code="await image_tool()")
-
-    assert any(
-        isinstance(item, ContentText) and "here is your image" in item.text
-        for item in result
-    )
-
-    assert any(isinstance(item, ContentImage) for item in result)
 
 
 @pytest.mark.anyio

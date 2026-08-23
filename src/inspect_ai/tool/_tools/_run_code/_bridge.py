@@ -3,15 +3,20 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeGuard, get_args
 from uuid import uuid4
 
+from pydantic import TypeAdapter
 from pydantic_core import to_jsonable_python
 
 from ...._util.content import (
     Content,
+    ContentAudio,
     ContentBase,
+    ContentDocument,
+    ContentImage,
     ContentText,
+    ContentVideo,
 )
 from ...._util.exception import TerminateSampleError
 from ...._util.working import sample_waiting_time
@@ -21,6 +26,17 @@ from ....util._sandbox.events import SandboxTimeoutError
 from ..._tool import ToolApprovalError, ToolError, ToolParsingError, tool_result_content
 from ..._tool_call import ToolCallError
 from ..._tool_def import ToolDef
+
+_content_adapter: TypeAdapter[list[Content]] = TypeAdapter(list[Content])
+
+_content_classes: tuple[type, ...] = get_args(Content)
+
+# Mirrors the content-only member types of ToolResult (see tool/_tool.py) —
+# keep in sync if ToolResult's content union changes.
+
+ToolResultContent = (
+    ContentText | ContentImage | ContentAudio | ContentVideo | ContentDocument
+)
 
 
 def _preview(value: Any, *, max_chars: int = 500) -> str:
@@ -54,27 +70,32 @@ def _tool_call_arguments(
 
 def _content_to_runtime_value(
     content: list[Content],
-) -> tuple[str, list[Content]]:
-    """Extract text for Monty runtime, collecting non-text content as artifacts."""
-    text_parts: list[str] = []
-    collected_artifacts: list[Content] = []
+) -> Any:
+    """Serialize Content into a Monty-native value crossing the boundary."""
+    if len(content) == 1 and isinstance(content[0], ContentText):
+        return content[0].text
+    return _content_adapter.dump_python(content, mode="json")
 
-    for item in content:
-        match item:
-            case ContentText():
-                # Only text is projected into the Monty runtime.
-                text_parts.append(item.text)
-            case _:
-                # All other content types are preserved as artifacts.
-                collected_artifacts.append(item)
 
-    if text_parts:
-        return "\n".join(text_parts), collected_artifacts
+def _is_content(value: object) -> TypeGuard[Content]:
+    return isinstance(value, _content_classes)
 
+
+def _is_content_list(value: object) -> TypeGuard[list[Content]]:
     return (
-        f"[{len(collected_artifacts)} non-text artifact(s) generated]",
-        collected_artifacts,
+        isinstance(value, list)
+        and len(value) > 0
+        and all(_is_content(v) for v in value)
     )
+
+
+def _tool_event_result_content(result: Any) -> str | list[ToolResultContent]:
+    """Convert a raw inner tool result to transcript-friendly content."""
+    if _is_content(result):
+        return tool_result_content([result])
+    if _is_content_list(result):
+        return tool_result_content(result)
+    return str(result)
 
 
 class RunCodeToolCallError(NamedTuple):
@@ -84,19 +105,6 @@ class RunCodeToolCallError(NamedTuple):
 
 def _format_tool_error(error: RunCodeToolCallError) -> str:
     return f"{error.type}: {error.message}"
-
-
-def _tool_event_result_content(result: Any) -> str | list[Content]:
-    """Convert a raw inner tool result to transcript-friendly content."""
-    if isinstance(result, ContentBase):
-        return tool_result_content([result])
-
-    if isinstance(result, list) and all(
-        isinstance(item, ContentBase) for item in result
-    ):
-        return tool_result_content(result)
-
-    return str(result)
 
 
 def _finalize_tool_event(
@@ -243,7 +251,6 @@ class RunCodeToolBridge:
         self.tool_defs = tool_defs
         self.max_tool_calls = max_inner_tool_calls
         self.call_trace: list[RunCodeInnerToolCallTraceEntry] = []
-        self.artifacts: list[Content] = []
 
     def external_functions(self) -> dict[str, Callable[..., Any]]:
         """Create Monty external functions for allowlisted Inspect tools."""
@@ -277,15 +284,11 @@ class RunCodeToolBridge:
             kwargs_preview=_preview(kwargs),
         )
         self.call_trace.append(call_trace_entry)
-        artifacts_before = len(self.artifacts)
 
         try:
             result = await self._execute_inspect_tool_call(tool_def, arguments)
             value = self._project_result(result, tool_def.name)
-            artifact_count = len(self.artifacts) - artifacts_before
-            call_trace_entry.result_preview = (
-                f"{_preview(value)} | artifacts={artifact_count}"
-            )
+            call_trace_entry.result_preview = f"{_preview(value)}"
             return value
         except Exception as exc:
             call_trace_entry.error = str(exc)
@@ -297,9 +300,10 @@ class RunCodeToolBridge:
         Three cases:
           - Scalars (str/int/float/bool) cross natively so code can chain them
             into later calls or compute on them.
-          - Content results are handled at the boundary: ContentText is projected
-            into the runtime as text, while non-text Content is kept outside the
-            runtime and appended to the final run_code result as artifacts.
+          - Content results are handled at the boundary: a single ContentText is
+            projected into the runtime as text; any other Content (e.g. images)
+            crosses the boundary serialized via Pydantic `dump_python` (in) /
+            `validate_python` (out), under the code's control like any other value.
           - JSON-serializable structured data is converted to native Python values
             so code can index, iterate, and aggregate over it.
         """
@@ -308,9 +312,7 @@ class RunCodeToolBridge:
 
         if self._is_content_result(result):
             content = result if isinstance(result, list) else [result]
-            text, new_artifacts = _content_to_runtime_value(content)
-            self.artifacts.extend(new_artifacts)
-            return text
+            return _content_to_runtime_value(content)
 
         try:
             return to_jsonable_python(result, fallback=lambda value: str(value))
