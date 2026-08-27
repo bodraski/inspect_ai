@@ -19,7 +19,6 @@ from ._run_code_executor import (
     MontyRunCodeExecutor,
     RunCodeExecutor,
     RunCodeResult,
-    StubRunCodeExecutor,
 )
 
 TRUNCATION_MARKER = "..."
@@ -58,7 +57,7 @@ def _tool_signature(tool_def: ToolDef) -> str:
 
 
 def _resolve_executor(
-    executor: RunCodeExecutor | Literal["monty", "stub"],
+    executor: RunCodeExecutor | Literal["monty"],
     *,
     tool_defs: list[ToolDef],
     max_inner_tool_calls: int | None,
@@ -74,8 +73,6 @@ def _resolve_executor(
                 tool_defs=tool_defs,
                 max_inner_tool_calls=max_inner_tool_calls,
             )
-        if executor == "stub":
-            return StubRunCodeExecutor()
         raise ValueError(f"Unknown run_code executor: {executor}")
 
     return executor
@@ -186,7 +183,7 @@ async def _truncate_content(
     """Truncate content to fit within a token budget.
 
     Processes items in consecutive order.
-    Once an  doesn't fit, it is truncated or replaced with a fallback,
+    Once an item doesn't fit, it is truncated or replaced with a fallback,
     and no subsequent items are included.
 
     """
@@ -276,6 +273,15 @@ def _run_code_usage_description(tool_defs: list[ToolDef]) -> str:
         "Only a limited set of standard-library imports is available, such as asyncio, json, re, math, and datetime. Tool calls must be awaited.",
         "The final expression is returned as the run_code result.",
         "",
+        "Tool results may contain non-text content (images, audio, video, documents) as opaque "
+        "binary/media objects, not strings:",
+        "- If a tool returns a list mixing text and media content, INDEX INTO the list "
+        "(e.g. result[1]) to extract the specific item before passing it to another tool "
+        "- Do NOT use str(), repr(), f-strings, or manual byte-level parsing/decoding on them.",
+        "- Pass or return them as-is (directly, or inside plain lists/dicts) so they reach the "
+        "final result as real media content.",
+        "that expects a single typed Content object — do not pass the whole list.",
+        "",
     ]
 
     if tool_defs:
@@ -297,6 +303,13 @@ def _run_code_usage_description(tool_defs: list[ToolDef]) -> str:
                 "results",
                 "```",
                 "",
+                "",
+                "Example — indexing into a mixed list before passing to a typed tool:",
+                "```python",
+                "screenshot = await fake_screenshot()",
+                "# screenshot is [ContentText, ContentImage] — index to get the image alone",
+                "metadata = await image_metadata(screenshot[1])",
+                "```",
                 _tool_interface_description(tool_defs),
             ]
         )
@@ -315,7 +328,7 @@ def _run_code_usage_description(tool_defs: list[ToolDef]) -> str:
 def run_code(
     tools: Sequence[Tool] | None = None,
     timeout: float | None = None,
-    executor: RunCodeExecutor | Literal["monty", "stub"] = "monty",
+    executor: RunCodeExecutor | Literal["monty"] = "monty",
     max_inner_tool_calls: int | None = None,
     include_tool_call_trace: bool = False,
     max_output_tokens: int | None = None,
@@ -326,8 +339,7 @@ def run_code(
         tools: Tools that code executed by run_code may call.
         timeout: Maximum execution time in seconds.
         executor: Executor used to run code. Use "monty" for the Pydantic Monty-backed executor,
-            "stub" for the placeholder executor, or pass a custom
-            RunCodeExecutor for tests / alternative backends.
+            or pass a custom RunCodeExecutor for tests / alternative backends.
         max_inner_tool_calls: Maximum number of allowlisted tool calls from inside run_code.
         include_tool_call_trace: Whether to include a compact trace of inner tool calls in the result.
         max_output_tokens: Maximum number of tokens returned by run_code. If None, output is not truncated.

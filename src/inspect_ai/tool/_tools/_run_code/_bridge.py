@@ -3,7 +3,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, NamedTuple, TypeGuard, get_args
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from pydantic import TypeAdapter
@@ -11,32 +11,22 @@ from pydantic_core import to_jsonable_python
 
 from ...._util.content import (
     Content,
-    ContentAudio,
     ContentBase,
-    ContentDocument,
-    ContentImage,
     ContentText,
-    ContentVideo,
 )
 from ...._util.exception import TerminateSampleError
 from ...._util.working import sample_waiting_time
 from ....util import OutputLimitExceededError
 from ....util._limit import LimitExceededError
 from ....util._sandbox.events import SandboxTimeoutError
-from ..._tool import ToolApprovalError, ToolError, ToolParsingError, tool_result_content
+from ..._tool import ToolApprovalError, ToolError, ToolParsingError, ToolResult
 from ..._tool_call import ToolCallError
 from ..._tool_def import ToolDef
 
+if TYPE_CHECKING:
+    from ....event._tool import ToolEvent
+
 _content_adapter: TypeAdapter[list[Content]] = TypeAdapter(list[Content])
-
-_content_classes: tuple[type, ...] = get_args(Content)
-
-# Mirrors the content-only member types of ToolResult (see tool/_tool.py) —
-# keep in sync if ToolResult's content union changes.
-
-ToolResultContent = (
-    ContentText | ContentImage | ContentAudio | ContentVideo | ContentDocument
-)
 
 
 def _preview(value: Any, *, max_chars: int = 500) -> str:
@@ -70,47 +60,27 @@ def _tool_call_arguments(
 
 def _content_to_runtime_value(
     content: list[Content],
+    *,
+    preserve_list_shape: bool,
 ) -> Any:
     """Serialize Content into a Monty-native value crossing the boundary."""
-    if len(content) == 1 and isinstance(content[0], ContentText):
-        return content[0].text
+    if not preserve_list_shape:
+        item = content[0]
+        if isinstance(item, ContentText):
+            return item.text
+        return _content_adapter.dump_python([item], mode="json")[0]
     return _content_adapter.dump_python(content, mode="json")
 
 
-def _is_content(value: object) -> TypeGuard[Content]:
-    return isinstance(value, _content_classes)
-
-
-def _is_content_list(value: object) -> TypeGuard[list[Content]]:
-    return (
-        isinstance(value, list)
-        and len(value) > 0
-        and all(_is_content(v) for v in value)
-    )
-
-
-def _tool_event_result_content(result: Any) -> str | list[ToolResultContent]:
-    """Convert a raw inner tool result to transcript-friendly content."""
-    if _is_content(result):
-        return tool_result_content([result])
-    if _is_content_list(result):
-        return tool_result_content(result)
-    return str(result)
-
-
-class RunCodeToolCallError(NamedTuple):
-    type: str
-    message: str
-
-
-def _format_tool_error(error: RunCodeToolCallError) -> str:
+def _format_tool_error(error: ToolCallError) -> str:
     return f"{error.type}: {error.message}"
 
 
 def _finalize_tool_event(
-    event: Any,
+    event: ToolEvent,
     *,
-    result: Any,
+    tool_name: str,
+    result: ToolResult,
     waiting_start: float,
     error: ToolCallError | None = None,
     agent: str | None = None,
@@ -119,10 +89,13 @@ def _finalize_tool_event(
 ) -> None:
     """Finalize the pending inner tool event recorded by call_tool(...)."""
     from ....log._transcript import transcript
+    from ....model._call_tools import tool_event_result
+
+    content, truncated = tool_event_result(tool_name, result, None)
 
     event._set_result(
-        result=_tool_event_result_content(result),
-        truncated=None,
+        result=content,
+        truncated=truncated,
         error=error,
         waiting_time=sample_waiting_time() - waiting_start,
         agent=agent,
@@ -137,10 +110,21 @@ def _finalize_tool_event(
         transcript()._event(event)
 
 
+def _is_control_flow_exception(exc: BaseException) -> bool:
+    """Whether an exception steers the eval rather than reporting a tool failure.
+
+    Terminate and cancellation must reach the caller as themselves. Monty
+    rebuilds exceptions from its own type list, so both lose their class on the
+    way out (``TerminateSampleError`` arrives as a plain ``RuntimeError``) and
+    the generated code can swallow either with a bare ``except``.
+    """
+    return isinstance(exc, TerminateSampleError) or not isinstance(exc, Exception)
+
+
 def _exception_to_tool_error(
-    exc: Exception,
+    exc: BaseException,
     tool_name: str,
-) -> RunCodeToolCallError | None:
+) -> ToolCallError | None:
     """Convert known recoverable tool exceptions to model-visible errors.
 
     This mirrors the kinds of tool failures that Inspect's higher-level
@@ -148,29 +132,29 @@ def _exception_to_tool_error(
     Unknown exceptions intentionally return None so they still propagate.
     """
     if isinstance(exc, ToolParsingError):
-        return RunCodeToolCallError(type="parsing", message=exc.message)
+        return ToolCallError(type="parsing", message=exc.message)
 
     if isinstance(exc, ToolApprovalError):
-        return RunCodeToolCallError(type="approval", message=exc.message)
+        return ToolCallError(type="approval", message=exc.message)
 
     if isinstance(exc, ToolError):
-        return RunCodeToolCallError(type="unknown", message=exc.message)
+        return ToolCallError(type="unknown", message=exc.message)
 
     if isinstance(exc, (TimeoutError, SandboxTimeoutError)):
-        return RunCodeToolCallError(
+        return ToolCallError(
             type="timeout",
             message="Command timed out before completing.",
         )
 
     if isinstance(exc, UnicodeDecodeError):
-        return RunCodeToolCallError(
+        return ToolCallError(
             type="unicode_decode",
             message=f"Error decoding bytes to {exc.encoding}: {exc.reason}.",
         )
 
     if isinstance(exc, ValueError):
         if "embedded null byte" in str(exc):
-            return RunCodeToolCallError(
+            return ToolCallError(
                 type="parsing",
                 message=(
                     f"An argument to tool '{tool_name}' contained an embedded "
@@ -183,29 +167,29 @@ def _exception_to_tool_error(
         err = f"{exc.strerror or str(exc)}."
         if isinstance(exc.filename, str):
             err = f"{err} Filename '{exc.filename}'."
-        return RunCodeToolCallError(type="permission", message=err)
+        return ToolCallError(type="permission", message=err)
 
     if isinstance(exc, FileNotFoundError):
         if isinstance(exc.filename, str):
             err = f"File '{exc.filename}' was not found."
         else:
             err = exc.strerror or str(exc)
-        return RunCodeToolCallError(type="file_not_found", message=err)
+        return ToolCallError(type="file_not_found", message=err)
 
     if isinstance(exc, IsADirectoryError):
         err = f"{exc.strerror or str(exc)}."
         if isinstance(exc.filename, str):
             err = f"{err} Filename '{exc.filename}'."
-        return RunCodeToolCallError(type="is_a_directory", message=err)
+        return ToolCallError(type="is_a_directory", message=err)
 
     if isinstance(exc, OutputLimitExceededError):
-        return RunCodeToolCallError(
+        return ToolCallError(
             type="limit",
             message=f"The tool exceeded its output limit of {exc.limit_str}.",
         )
 
     if isinstance(exc, LimitExceededError):
-        return RunCodeToolCallError(
+        return ToolCallError(
             type="limit",
             message=f"The tool exceeded its {exc.type} limit of {exc.limit_str}.",
         )
@@ -251,6 +235,12 @@ class RunCodeToolBridge:
         self.tool_defs = tool_defs
         self.max_tool_calls = max_inner_tool_calls
         self.call_trace: list[RunCodeInnerToolCallTraceEntry] = []
+        self.control_flow_exception: BaseException | None = None
+
+    def raise_pending_control_flow(self) -> None:
+        """Re-raise a terminate or cancellation raised by an inner tool call."""
+        if self.control_flow_exception is not None:
+            raise self.control_flow_exception
 
     def external_functions(self) -> dict[str, Callable[..., Any]]:
         """Create Monty external functions for allowlisted Inspect tools."""
@@ -270,6 +260,10 @@ class RunCodeToolBridge:
         return external_functions
 
     async def _call_tool(self, tool_def: ToolDef, *args: Any, **kwargs: Any) -> Any:
+        # the code keeps running after swallowing a terminate, so refuse the
+        # calls it makes on the way out
+        self.raise_pending_control_flow()
+
         if (
             self.max_tool_calls is not None
             and len(self.call_trace) >= self.max_tool_calls
@@ -290,8 +284,10 @@ class RunCodeToolBridge:
             value = self._project_result(result, tool_def.name)
             call_trace_entry.result_preview = f"{_preview(value)}"
             return value
-        except Exception as exc:
+        except BaseException as exc:
             call_trace_entry.error = str(exc)
+            if _is_control_flow_exception(exc):
+                self.control_flow_exception = exc
             raise
 
     def _project_result(self, result: Any, tool_name: str) -> Any:
@@ -300,19 +296,27 @@ class RunCodeToolBridge:
         Three cases:
           - Scalars (str/int/float/bool) cross natively so code can chain them
             into later calls or compute on them.
-          - Content results are handled at the boundary: a single ContentText is
-            projected into the runtime as text; any other Content (e.g. images)
-            crosses the boundary serialized via Pydantic `dump_python` (in) /
-            `validate_python` (out), under the code's control like any other value.
-          - JSON-serializable structured data is converted to native Python values
-            so code can index, iterate, and aggregate over it.
+          - Content results are serialized at the boundary via Pydantic
+            `dump_python`. The shape mirrors what the tool actually returned:
+            - a bare ContentText object projects as plain text;
+            - any other bare (non-list) Content object projects as a single
+              serialized dict;
+            - a Content list is always serialized as a list, preserving that
+              shape even when it contains exactly one item, so downstream code
+              and inner tool calls see the same shape the tool declared.
+          - JSON-serializable structured data is converted to native Python
+            values via `to_jsonable_python` so code can index, iterate, and
+            aggregate over it.
         """
         if isinstance(result, (str, int, float, bool)):
             return result
 
         if self._is_content_result(result):
-            content = result if isinstance(result, list) else [result]
-            return _content_to_runtime_value(content)
+            preserve_list_shape = isinstance(result, list)
+            content = result if preserve_list_shape else [result]
+            return _content_to_runtime_value(
+                content, preserve_list_shape=preserve_list_shape
+            )
 
         try:
             return to_jsonable_python(result, fallback=lambda value: str(value))
@@ -370,42 +374,39 @@ class RunCodeToolBridge:
         waiting_start = sample_waiting_time()
 
         try:
-            result, _messages, output, agent, agent_span_id = await call_tool(
+            result, _messages, _output, agent, agent_span_id = await call_tool(
                 self.tool_defs, message.text, call, event, [message]
             )
-        except TerminateSampleError:
-            _finalize_tool_event(
-                event,
-                result="",
-                waiting_start=waiting_start,
-                failed=True,
+        except BaseException as ex:
+            tool_error = (
+                None
+                if _is_control_flow_exception(ex)
+                else _exception_to_tool_error(ex, call.function)
             )
-            raise
-        except Exception as ex:
-            tool_error = _exception_to_tool_error(ex, call.function)
-            if tool_error is not None:
-                formatted_error = _format_tool_error(tool_error)
+            if tool_error is None:
                 _finalize_tool_event(
                     event,
-                    result=formatted_error,
+                    tool_name=call.function,
+                    result="",
                     waiting_start=waiting_start,
-                    error=ToolCallError(
-                        type=tool_error.type, message=tool_error.message
-                    ),
+                    failed=True,
                 )
-                return formatted_error
+                raise
 
+            formatted_error = _format_tool_error(tool_error)
             _finalize_tool_event(
                 event,
-                result="",
+                tool_name=call.function,
+                result=formatted_error,
                 waiting_start=waiting_start,
-                failed=True,
+                error=tool_error,
             )
-            raise
+            return formatted_error
         else:
             _finalize_tool_event(
                 event,
-                result=output,
+                tool_name=call.function,
+                result=result,
                 waiting_start=waiting_start,
                 agent=agent,
                 agent_span_id=agent_span_id,

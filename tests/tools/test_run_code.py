@@ -1,8 +1,10 @@
+import json
+
 import anyio
 import pytest
 from test_helpers.utils import skip_if_trio
 
-from inspect_ai._util.content import ContentImage, ContentText
+from inspect_ai._util.content import ContentDocument, ContentImage, ContentText
 from inspect_ai._util.exception import TerminateSampleError
 from inspect_ai._util.registry import registry_info
 from inspect_ai.approval import ApprovalPolicy, approval, auto_approver
@@ -13,7 +15,9 @@ from inspect_ai.tool._tools._run_code._bridge import (
     RunCodeInnerToolCallTraceEntry,
     RunCodeMaxToolCallsExceededError,
     RunCodeToolBridge,
+    _content_to_runtime_value,
     _preview,
+    _tool_call_arguments,
 )
 from inspect_ai.tool._tools._run_code._run_code import (
     TRUNCATION_MARKER,
@@ -24,7 +28,11 @@ from inspect_ai.tool._tools._run_code._run_code import (
     _tool_signature,
     _validate_tool_names,
 )
-from inspect_ai.tool._tools._run_code._run_code_executor import RunCodeResult
+from inspect_ai.tool._tools._run_code._run_code_executor import (
+    RunCodeResult,
+    _looks_like_content,
+    _reconstruct_content,
+)
 
 
 def test_run_code_tool_constructs():
@@ -49,15 +57,6 @@ def test_run_code_viewer_renders_code():
 
     assert view.call is not None
     assert "```python\n1 + 1\n```" in view.call.content
-
-
-@pytest.mark.anyio
-async def test_run_code_tool_executes_stub_when_requested():
-    tool = run_code(executor="stub")
-
-    result = await tool(code="1")
-
-    assert "not implemented" in result[0].text
 
 
 def dummy_tool() -> Tool:
@@ -1071,6 +1070,92 @@ async def test_run_code_bridge_propagates_terminate_sample_error():
             await external_functions["dummy_tool"]("secret")
 
 
+@pytest.mark.anyio
+async def test_run_code_bridge_refuses_calls_after_terminate():
+    bridge = RunCodeToolBridge(_tool_defs([dummy_tool()]))
+    external_functions = bridge.external_functions()
+
+    with approval(
+        [
+            ApprovalPolicy(
+                approver=auto_approver(decision="terminate"),
+                tools="dummy_tool",
+            )
+        ]
+    ):
+        with pytest.raises(TerminateSampleError):
+            await external_functions["dummy_tool"]("secret")
+
+    # the policy is gone, but the terminate still stands
+    with pytest.raises(TerminateSampleError):
+        await external_functions["dummy_tool"]("again")
+
+
+@pytest.mark.anyio
+@skip_if_trio  # pydantic-monty runs on asyncio
+async def test_run_code_terminate_survives_swallowing_code():
+    pytest.importorskip("pydantic_monty")
+
+    tool = run_code(tools=[dummy_tool()], executor="monty")
+
+    with approval(
+        [
+            ApprovalPolicy(
+                approver=auto_approver(decision="terminate"),
+                tools="dummy_tool",
+            )
+        ]
+    ):
+        with pytest.raises(TerminateSampleError):
+            await tool(
+                code=(
+                    "try:\n"
+                    '    await dummy_tool("secret")\n'
+                    '    result = "called"\n'
+                    "except Exception:\n"
+                    '    result = "swallowed"\n'
+                    "result\n"
+                )
+            )
+
+
+@pytest.mark.anyio
+@skip_if_trio  # pydantic-monty runs on asyncio
+async def test_run_code_cancellation_survives_swallowing_code():
+    pytest.importorskip("pydantic_monty")
+
+    cancelled_exc_class = anyio.get_cancelled_exc_class()
+
+    def cancelling_tool() -> Tool:
+        async def execute(value: str) -> str:
+            """Cancel the caller.
+
+            Args:
+                value: Ignored.
+            """
+            raise cancelled_exc_class()
+
+        return ToolDef(
+            execute,
+            name="cancelling_tool",
+            description="Cancels the caller.",
+        ).as_tool()
+
+    tool = run_code(tools=[cancelling_tool()], executor="monty")
+
+    with pytest.raises(cancelled_exc_class):
+        await tool(
+            code=(
+                "try:\n"
+                '    await cancelling_tool("x")\n'
+                '    result = "called"\n'
+                "except BaseException:\n"
+                '    result = "swallowed"\n'
+                "result\n"
+            )
+        )
+
+
 def file_not_found_tool() -> Tool:
     async def execute(path: str) -> str:
         """Raise FileNotFoundError.
@@ -1142,3 +1227,498 @@ async def test_run_code_bridge_finalizes_inner_tool_event():
     assert event.pending is not True
     assert event.completed is not None
     assert event.working_time is not None
+    assert event.result == "3"
+
+
+@pytest.mark.anyio
+async def test_run_code_bridge_truncates_inner_tool_event_result():
+    from inspect_ai.event._tool import ToolEvent
+    from inspect_ai.log._transcript import transcript
+
+    def long_output_tool() -> Tool:
+        async def execute(value: str) -> str:
+            """Return a long string.
+
+            Args:
+                value: Value to repeat.
+            """
+            return value * (32 * 1024)
+
+        return ToolDef(
+            execute,
+            name="long_output_tool",
+            description="Returns a long string.",
+        ).as_tool()
+
+    before = len(transcript().events)
+
+    bridge = RunCodeToolBridge(_tool_defs([long_output_tool()]))
+    external_functions = bridge.external_functions()
+
+    result = await external_functions["long_output_tool"]("x")
+
+    # the code gets the whole result, the transcript gets a bounded one
+    assert len(result) == 32 * 1024
+
+    event = [
+        event
+        for event in transcript().events[before:]
+        if isinstance(event, ToolEvent) and event.function == "long_output_tool"
+    ][-1]
+
+    assert event.truncated == (32 * 1024, 16 * 1024)
+    assert "too long to be displayed" in event.result
+
+
+def test_looks_like_content_false_positive_on_bare_type_key():
+    value = {"type": "text", "value": 42}
+    assert _looks_like_content(value) is False
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {"type": "text", "text": "hello"},
+        {"type": "image", "image": "base64data"},
+        {"type": "audio", "audio": "base64data", "format": "wav"},
+        {"type": "video", "video": "base64data", "format": "mp4"},
+        {"type": "document", "document": "base64data"},
+    ],
+)
+def test_looks_like_content_true_positive(value):
+    assert _looks_like_content(value) is True
+
+
+def test_looks_like_content_false_positive_missing_required_field():
+    value = {"type": "audio", "audio": "base64data"}  # missing "format"
+    assert _looks_like_content(value) is False
+
+
+def test_looks_like_content_false_positive_wrong_field_type():
+    value = {"type": "text", "text": 12345}
+    assert _looks_like_content(value) is False
+
+
+def test_looks_like_content_unknown_type():
+    value = {"type": "something_else", "text": "hello"}
+    assert _looks_like_content(value) is False
+
+
+def test_looks_like_content_document_optional_fields_defaulted():
+    value = {"type": "document", "document": "base64data"}
+    assert _looks_like_content(value) is True
+
+
+def test_single_content_text_collapses_to_plain_string():
+    content = [ContentText(text="hello")]
+    result = _content_to_runtime_value(content, preserve_list_shape=False)
+    assert result == "hello"
+    assert isinstance(result, str)
+
+
+def test_multi_content_does_not_collapse():
+    content = [ContentText(text="a"), ContentText(text="b")]
+    result = _content_to_runtime_value(content, preserve_list_shape=True)
+    assert isinstance(result, list)
+
+
+def test_single_content_text_roundtrips_through_reconstruct():
+    content = [ContentText(text="hello")]
+    projected = _content_to_runtime_value(content, preserve_list_shape=False)
+    reconstructed = _reconstruct_content(projected)
+    assert reconstructed == [ContentText(text="hello")]
+
+
+def test_projected_text_passed_as_str_argument_to_next_tool():
+    content = [ContentText(text="hello")]
+    projected = _content_to_runtime_value(content, preserve_list_shape=False)
+
+    def next_tool(message: str) -> str:
+        return message.upper()
+
+    tool_def = ToolDef(next_tool, name="next_tool")
+    args = _tool_call_arguments(tool_def, (projected,), {})
+    assert args == {"message": "hello"}
+
+
+def test_projected_text_remains_plain_string_for_next_tool():
+    content = [ContentText(text="hello")]
+    projected = _content_to_runtime_value(content, preserve_list_shape=False)
+
+    def next_tool(payload: ContentText) -> str:
+        return payload.text
+
+    tool_def = ToolDef(next_tool, name="next_tool")
+    args = _tool_call_arguments(tool_def, (projected,), {})
+    assert isinstance(args["payload"], str)
+    assert not isinstance(args["payload"], ContentText)
+
+
+def test_single_content_image_with_preserved_list_shape_stays_array():
+    content = [ContentImage(image=MOCK_BASE64_IMAGE)]
+
+    result = _content_to_runtime_value(
+        content,
+        preserve_list_shape=True,
+    )
+
+    assert isinstance(result, list)
+    assert len(result) == 1
+    assert result[0]["type"] == "image"
+    assert result[0]["image"] == MOCK_BASE64_IMAGE
+
+
+def test_single_content_image_is_serialized_as_single_object():
+    content = [ContentImage(image=MOCK_BASE64_IMAGE)]
+
+    result = _content_to_runtime_value(
+        content,
+        preserve_list_shape=False,
+    )
+
+    assert isinstance(result, dict)
+    assert result["type"] == "image"
+    assert result["image"] == MOCK_BASE64_IMAGE
+
+
+def image_tool() -> Tool:
+    async def execute() -> ContentImage:
+        """Return an image.
+
+        Returns:
+            An image.
+        """
+        return ContentImage(image=MOCK_BASE64_IMAGE)
+
+    return ToolDef(
+        execute,
+        name="image_tool",
+        description="Returns an image.",
+    ).as_tool()
+
+
+def image_list_tool() -> Tool:
+    async def execute() -> list[ContentImage]:
+        """Return a list of images.
+
+        Returns:
+            A list of images.
+        """
+        return [ContentImage(image=MOCK_BASE64_IMAGE)]
+
+    return ToolDef(
+        execute,
+        name="image_list_tool",
+        description="Returns a list of images.",
+    ).as_tool()
+
+
+def image_receiving_tool(received: list) -> Tool:
+    async def execute(image: ContentImage) -> str:
+        """Receive an image.
+
+        Args:
+            image: Image to receive.
+        """
+        received.append(image)
+        return "received"
+
+    return ToolDef(
+        execute,
+        name="image_receiving_tool",
+        description="Receives an image.",
+    ).as_tool()
+
+
+def image_list_receiving_tool(received: list) -> Tool:
+    async def execute(images: list[ContentImage]) -> str:
+        """Receive a list of images.
+
+        Args:
+            images: Images to receive.
+        """
+        received.append(images)
+        return f"received:{len(images)}"
+
+    return ToolDef(
+        execute,
+        name="image_list_receiving_tool",
+        description="Receives a list of images.",
+    ).as_tool()
+
+
+def empty_image_list_tool() -> Tool:
+    async def execute() -> list[ContentImage]:
+        """Return an empty list of images.
+
+        Returns:
+            An empty list.
+        """
+        return []
+
+    return ToolDef(
+        execute,
+        name="empty_image_list_tool",
+        description="Returns an empty list of images.",
+    ).as_tool()
+
+
+def test_is_content_result_false_for_empty_list():
+    bridge = RunCodeToolBridge([])
+    assert bridge._is_content_result([]) is False
+
+
+@pytest.mark.anyio
+@skip_if_trio  # pydantic-monty runs on asyncio
+async def test_run_code_discarded_image_not_in_final_result():
+    pytest.importorskip("pydantic_monty")
+
+    tool = run_code(tools=[image_tool()], executor="monty")
+
+    result = await tool(
+        code="""
+await image_tool()
+"done"
+"""
+    )
+
+    assert "done" in result[0].text
+    assert not any(isinstance(item, ContentImage) for item in result)
+
+
+@pytest.mark.anyio
+@skip_if_trio  # pydantic-monty runs on asyncio
+async def test_run_code_returned_image_reaches_final_result():
+    pytest.importorskip("pydantic_monty")
+
+    tool = run_code(tools=[image_tool()], executor="monty")
+
+    result = await tool(
+        code="""
+img = await image_tool()
+img
+"""
+    )
+
+    image_items = [item for item in result if isinstance(item, ContentImage)]
+    assert len(image_items) == 1
+    assert image_items[0].image == MOCK_BASE64_IMAGE
+
+
+@pytest.mark.anyio
+@skip_if_trio  # pydantic-monty runs on asyncio
+async def test_run_code_passes_image_between_tools():
+    received: list = []
+    tool = run_code(
+        tools=[image_tool(), image_receiving_tool(received)],
+        executor="monty",
+    )
+
+    result = await tool(
+        code="""
+img = await image_tool()
+await image_receiving_tool(img)
+"""
+    )
+
+    assert "received" in result[0].text
+    assert len(received) == 1
+    assert isinstance(received[0], ContentImage)
+    assert received[0].image == MOCK_BASE64_IMAGE
+
+
+@pytest.mark.anyio
+@skip_if_trio  # pydantic-monty runs on asyncio
+async def test_run_code_passes_single_image_list_between_tools():
+    pytest.importorskip("pydantic_monty")
+
+    received: list = []
+    tool = run_code(
+        tools=[image_tool(), image_list_receiving_tool(received)],
+        executor="monty",
+    )
+
+    result = await tool(
+        code="""
+img = await image_tool()
+await image_list_receiving_tool([img])
+"""
+    )
+
+    assert "received:1" in result[0].text
+    assert len(received) == 1
+    assert len(received[0]) == 1
+    assert isinstance(received[0][0], ContentImage)
+
+
+@pytest.mark.anyio
+@skip_if_trio  # pydantic-monty runs on asyncio
+async def test_run_code_single_element_list_result_preserves_array_shape():
+    pytest.importorskip("pydantic_monty")
+
+    received: list = []
+    tool = run_code(
+        tools=[image_list_tool(), image_list_receiving_tool(received)],
+        executor="monty",
+    )
+
+    result = await tool(
+        code="""
+imgs = await image_list_tool()
+await image_list_receiving_tool(imgs)
+"""
+    )
+
+    assert "received:1" in result[0].text
+    assert len(received) == 1
+    assert len(received[0]) == 1
+    assert isinstance(received[0][0], ContentImage)
+
+
+@pytest.mark.anyio
+@skip_if_trio  # pydantic-monty runs on asyncio
+async def test_run_code_empty_content_list_result():
+    pytest.importorskip("pydantic_monty")
+
+    received: list = []
+    tool = run_code(
+        tools=[empty_image_list_tool(), image_list_receiving_tool(received)],
+        executor="monty",
+    )
+
+    result = await tool(
+        code="""
+imgs = await empty_image_list_tool()
+await image_list_receiving_tool(imgs)
+"""
+    )
+
+    assert "received:0" in result[0].text
+    assert len(received) == 1
+    assert received[0] == []
+
+
+def test_reconstruct_content_flat_list_unchanged():
+    value = [
+        {"type": "text", "text": "hello"},
+        {"type": "image", "image": MOCK_BASE64_IMAGE},
+    ]
+    result = _reconstruct_content(value)
+    assert result == [
+        ContentText(text="hello"),
+        ContentImage(image=MOCK_BASE64_IMAGE),
+    ]
+
+
+def test_reconstruct_content_plain_structured_data_no_content():
+    value = [{"id": 1, "amount": 10}, {"id": 2, "amount": 32}]
+    result = _reconstruct_content(value)
+    assert len(result) == 1
+    assert isinstance(result[0], ContentText)
+    assert json.loads(result[0].text) == value
+
+
+def test_reconstruct_content_extracts_nested_mixed_content():
+    value = [
+        [
+            {"type": "text", "text": "screenshot taken successfully"},
+            {"type": "image", "image": MOCK_BASE64_IMAGE},
+        ],
+        "Page title for https://example.com: Example Domain",
+        [
+            {"type": "text", "text": "document read successfully"},
+            {"type": "document", "document": "data:application/pdf;base64,AAAA"},
+        ],
+    ]
+
+    result = _reconstruct_content(value)
+
+    assert isinstance(result[0], ContentText)
+    skeleton = json.loads(result[0].text)
+    assert skeleton[1] == "Page title for https://example.com: Example Domain"
+    assert skeleton[0][0].startswith("<content:")
+    assert skeleton[0][1].startswith("<content:")
+
+    extracted = result[1:]
+    assert len(extracted) == 4
+    assert extracted[0] == ContentText(text="screenshot taken successfully")
+    assert isinstance(extracted[1], ContentImage)
+    assert extracted[2] == ContentText(text="document read successfully")
+    assert isinstance(extracted[3], ContentDocument)
+
+
+@pytest.mark.anyio
+@skip_if_trio  # pydantic-monty runs on asyncio
+async def test_run_code_gather_mixed_content_and_text_with_monty():
+    pytest.importorskip("pydantic_monty")
+
+    tool = run_code(tools=[image_tool(), dummy_tool()], executor="monty")
+
+    result = await tool(
+        code="""
+import asyncio
+
+results = await asyncio.gather(
+    image_tool(),
+    dummy_tool("hello"),
+)
+results
+"""
+    )
+
+    image_items = [item for item in result if isinstance(item, ContentImage)]
+    assert len(image_items) == 1
+    assert image_items[0].image == MOCK_BASE64_IMAGE
+
+
+@pytest.mark.anyio
+@skip_if_trio  # pydantic-monty runs on asyncio
+async def test_run_code_empty_image_list_result():
+    pytest.importorskip("pydantic_monty")
+
+    tool = run_code(
+        tools=[empty_image_list_tool()],
+        executor="monty",
+    )
+
+    result = await tool(
+        code="""
+imgs = await empty_image_list_tool()
+imgs
+"""
+    )
+
+    assert len(result) == 1
+    assert result[0].text == "[]"
+
+
+def test_reconstruct_content_extracts_bare_content_dict_among_list_siblings():
+    value = [
+        [{"type": "text", "text": "ok"}, {"type": "image", "image": "AAAA"}],
+        "title string",
+        "plain string",
+        {"type": "image", "image": "AAAA"},
+    ]
+    result = _reconstruct_content(value)
+
+    skeleton = json.loads(result[0].text)
+    assert skeleton[3].startswith("<content:")
+    assert "AAAA" not in result[0].text  # no raw base64 leaking into the text skeleton
+
+    extracted = result[1:]
+    assert len(extracted) == 3
+    assert isinstance(extracted[-1], ContentImage)
+
+
+def test_reconstruct_content_handles_tuple_shape():
+    value = (
+        [{"type": "text", "text": "ok"}, {"type": "image", "image": "AAAA"}],
+        "title string",
+        "error text",
+    )
+    result = _reconstruct_content(value)
+
+    assert "AAAA" not in result[0].text
+    extracted = result[1:]
+    assert len(extracted) == 2
+    assert isinstance(extracted[-1], ContentImage)
